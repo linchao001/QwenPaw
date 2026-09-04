@@ -5039,6 +5039,7 @@ def _workspace_dir_key(workspace_dir: str | Path) -> str:
 
 
 @tool_descriptor(
+    name="browser_use",
     async_execution=True,
     tool_type="network",
     target_param="url",

@@ -53,11 +53,12 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("REME_DISABLE_LOGURU", "true")
 
 NO_MEMORY_RESULTS = "(no memory results)"
-INBOX_RESULT_JOB_NAMES = {"auto_memory", "auto_dream", "daily_paper"}
+INBOX_RESULT_JOB_NAMES = {"auto_memory", "auto_dream", "daily_paper", "knowledge_dream"}
 INBOX_NOTIFICATION_FIELDS = {
     "auto_memory": "auto_memory_inbox_push_enabled",
     "auto_dream": "auto_dream_inbox_push_enabled",
     "daily_paper": "daily_paper_inbox_push_enabled",
+    "knowledge_dream": "knowledge_dream_inbox_push_enabled",
 }
 INBOX_RESULT_HOOK_KEY = "qwenpaw_memory_result_hook"
 INBOX_EMITTED_METADATA_KEY = "_qwenpaw_inbox_emitted"
@@ -251,6 +252,13 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                     self._lifecycle_operation = None
                     self._lifecycle_condition.notify_all()
 
+    def _kb_enabled(self, memory_config: Any | None = None) -> bool:
+        """Return whether this agent mounts a ReMe shared knowledge base."""
+        if memory_config is None:
+            memory_config = self.get_memory_config()
+        kb_id = (getattr(memory_config, "knowledge_base_id", None) or "").strip()
+        return bool(kb_id)
+
     def get_memory_prompt(self) -> str:
         """Return memory guidance for system prompt injection."""
         agent_config = load_agent_config(self.agent_id)
@@ -260,6 +268,8 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             memory_search_enabled=cfg.memory_search_enabled,
             daily_dir=getattr(cfg, "daily_dir", "memory"),
             digest_dir=getattr(cfg, "digest_dir", "digest"),
+            knowledge_enabled=self._kb_enabled(cfg),
+            knowledge_dir=getattr(cfg, "knowledge_dir_name", "knowledge"),
         )
 
     def get_memory_config(self) -> Any:
@@ -294,13 +304,31 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                     misfire_grace_seconds=600,
                 ),
             )
+
+        if (
+            self._kb_enabled(cfg)
+            and cfg.knowledge_dream_cron_enabled
+            and cfg.knowledge_dream_cron
+        ):
+            jobs.append(
+                ServiceCronJob(
+                    key="knowledge-dream",
+                    cron=cfg.knowledge_dream_cron,
+                    callback=self.knowledge_dream,
+                    misfire_grace_seconds=600,
+                    jitter_seconds=60,
+                ),
+            )
         return jobs
 
     def list_memory_tools(self):
         """Return memory tool functions to register with the agent toolkit."""
         if not self.get_memory_config().memory_search_enabled:
             return []
-        return [self.memory_search]
+        tools = [self.memory_search]
+        if self._kb_enabled():
+            tools.append(self.save_to_knowledge)
+        return tools
 
     def get_auto_memory_interval(self) -> int:
         """Return ReMe light auto-memory cadence from agent config."""
@@ -616,6 +644,7 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             "auto_memory": "Auto-memory result",
             "auto_dream": "Auto-dream result",
             "daily_paper": "Daily Paper result",
+            "knowledge_dream": "Knowledge dream result",
         }.get(name, "Memory job result")
 
     @staticmethod
@@ -624,19 +653,114 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             "auto_memory": "Auto-memory completed with no returned content.",
             "auto_dream": "Auto-dream completed with no returned content.",
             "daily_paper": "Daily Paper completed with no returned content.",
+            "knowledge_dream": (
+                "Knowledge dream completed with no returned content."
+            ),
         }.get(name, "Memory job completed with no returned content.")
+
+    def _resolve_memory_search_scope(
+        self,
+        memory_config: Any,
+        scope: str,
+    ) -> str:
+        """Normalize memory_search scope for KB-capable agents."""
+        resolved = (scope or "").strip().lower()
+        if not resolved:
+            resolved = (
+                memory_config.knowledge_search_default or "knowledge"
+            ).strip().lower()
+        if not self._kb_enabled(memory_config):
+            return "agent"
+        if resolved not in ("all", "knowledge", "agent"):
+            return "knowledge"
+        return resolved
+
+    @staticmethod
+    def _search_results_from_response(response: Any) -> list[dict]:
+        metadata = getattr(response, "metadata", None)
+        if not isinstance(metadata, dict):
+            return []
+        raw = metadata.get("results")
+        return list(raw) if isinstance(raw, list) else []
+
+    @staticmethod
+    def _merge_dual_search_results(
+        knowledge_results: list[dict],
+        agent_results: list[dict],
+        cap: int,
+    ) -> list[dict]:
+        """Merge KB and private-memory hits with a KB floor quota."""
+        cap = max(1, cap)
+        if not knowledge_results:
+            return list(agent_results[:cap])
+        if not agent_results:
+            return list(knowledge_results[:cap])
+
+        def _score(item: dict) -> float:
+            return ReMeLightMemoryManager._extract_score(item)
+
+        knowledge_sorted = sorted(
+            knowledge_results,
+            key=_score,
+            reverse=True,
+        )
+        agent_sorted = sorted(agent_results, key=_score, reverse=True)
+        k_quota = max((cap + 1) // 2, min(cap, 2))
+        a_quota = cap - k_quota
+        taken = knowledge_sorted[:k_quota] + agent_sorted[:a_quota]
+        if len(taken) < cap:
+            seen = {id(item) for item in taken}
+            extras = [
+                item
+                for item in knowledge_sorted[k_quota:] + agent_sorted[a_quota:]
+                if id(item) not in seen
+            ]
+            for item in extras:
+                if len(taken) >= cap:
+                    break
+                taken.append(item)
+                seen.add(id(item))
+        return taken[:cap]
+
+    def _compose_merged_search_response(
+        self,
+        primary: "Response",
+        ordered_results: list[dict],
+    ) -> "Response":
+        link_expansion = {}
+        metadata = getattr(primary, "metadata", None)
+        if isinstance(metadata, dict):
+            raw = metadata.get("link_expansion")
+            if isinstance(raw, dict):
+                link_expansion = raw
+        answer = self._rebuild_search_answer_with_expansions(
+            ordered_results,
+            link_expansion,
+        )
+        primary.answer = answer
+        if isinstance(metadata, dict):
+            metadata["results"] = ordered_results
+        return primary
 
     async def memory_search(
         self,
         query: str,
         max_results: int = 5,
         min_score: float = 0,
+        scope: str = "",
+        bucket: str = "",
     ) -> ToolChunk:
         """Search memory files semantically.
 
-        Use this tool before answering questions about prior work,
-        decisions, dates, people, preferences, or todos. Returns top
-        relevant snippets with file paths and line numbers.
+        Call only when you clearly need prior work, decisions, dates,
+        people, preferences, todos, or shared-KB facts that are not
+        already in context. Do not search by default on the first reply.
+        Returns top relevant snippets with file paths and line numbers.
+
+        When a shared knowledge base is configured (``knowledge_base_id``),
+        the default scope searches published KB nodes via ReMe's
+        ``knowledge_search`` job. Use ``scope=all`` to mix private digest/daily
+        notes with shared KB hits, or ``scope=agent`` for private memory only.
 
         When a reranker is configured and enabled, this over-fetches
         (``max_results × candidate_multiplier``), reranks the candidates,
@@ -652,6 +776,13 @@ class ReMeLightMemoryManager(BaseMemoryManager):
                 at 0 in normal use because ReMe search may mix BM25 and fused
                 scores with different scales, and raising it can hide valid
                 keyword matches.
+            scope (`str`, optional):
+                ``knowledge`` (default when KB configured), ``agent`` (private
+                daily/digest only), or ``all`` (both).
+            bucket (`str`, optional):
+                Narrow shared-KB recall (``business``, ``test``,
+                ``business/wiki``, ``test/test_cases``, or ``all``). Ignored
+                when ``scope=agent``.
 
         Returns:
             `ToolResponse`:
@@ -661,6 +792,10 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         query = query.strip()
         if not query:
             return _tool_chunk("Error: query cannot be empty", ok=False)
+
+        memory_config = self.get_memory_config()
+        resolved_scope = self._resolve_memory_search_scope(memory_config, scope)
+        resolved_bucket = (bucket or "all").strip() or "all"
 
         reranker_config = await self._get_reranker_config()
         cap = max(1, max_results)
@@ -672,13 +807,57 @@ class ReMeLightMemoryManager(BaseMemoryManager):
             if reranker_config
             else cap
         )
+        min_score_value = max(0.0, min_score)
+        search_kwargs = {
+            "query": query,
+            "limit": effective_limit,
+            "min_score": min_score_value,
+        }
 
-        response = await self._run_reme_job(
-            "search",
-            query=query,
-            limit=effective_limit,
-            min_score=max(0.0, min_score),
-        )
+        if resolved_scope == "agent":
+            response = await self._run_reme_job("search", **search_kwargs)
+        elif resolved_scope == "knowledge":
+            response = await self._run_reme_job(
+                "knowledge_search",
+                bucket=resolved_bucket,
+                **search_kwargs,
+            )
+        else:
+            knowledge_resp, agent_resp = await asyncio.gather(
+                self._run_reme_job(
+                    "knowledge_search",
+                    query=query,
+                    limit=effective_limit,
+                    min_score=min_score_value,
+                    bucket=resolved_bucket,
+                ),
+                self._run_reme_job("search", **search_kwargs),
+            )
+            if knowledge_resp is None and agent_resp is None:
+                return _tool_chunk("ReMe is not started.", ok=False)
+            k_results = (
+                self._search_results_from_response(knowledge_resp)
+                if knowledge_resp is not None
+                else []
+            )
+            a_results = (
+                self._search_results_from_response(agent_resp)
+                if agent_resp is not None
+                else []
+            )
+            merged = self._merge_dual_search_results(
+                k_results,
+                a_results,
+                effective_limit,
+            )
+            base = knowledge_resp or agent_resp
+            response = self._compose_merged_search_response(base, merged)
+            response.success = bool(
+                (knowledge_resp and knowledge_resp.success)
+                or (agent_resp and agent_resp.success)
+                or merged,
+            )
+
         if response is None:
             return _tool_chunk("ReMe is not started.", ok=False)
 
@@ -692,6 +871,74 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         answer = str(response.answer or "").strip()
         if not answer:
             answer = NO_MEMORY_RESULTS
+        return _tool_chunk(answer, ok=response.success)
+
+    async def save_to_knowledge(
+        self,
+        title: str,
+        content: str,
+        bucket: str = "business/wiki",
+        preconditions: str = "",
+        steps: list[str] | None = None,
+        expected: str = "",
+        priority: str = "",
+        requirement_id: str = "",
+        links: list[str] | None = None,
+    ) -> ToolChunk:
+        """Publish or refine one node in the mounted shared knowledge base.
+
+        Delegates to ReMe ``save_to_knowledge``; merge/dedup/inbox routing
+        is handled inside ReMe.
+
+        Args:
+            title (`str`):
+                Node title / frontmatter name.
+            content (`str`):
+                Body summary or full content to persist.
+            bucket (`str`, optional):
+                Published bucket (default ``business/wiki``).
+            preconditions (`str`, optional):
+                Test-case preconditions when writing to test buckets.
+            steps (`list[str]`, optional):
+                Ordered test steps for test-case nodes.
+            expected (`str`, optional):
+                Expected result for test-case nodes.
+            priority (`str`, optional):
+                Case priority (P0–P3).
+            requirement_id (`str`, optional):
+                Linked requirement id.
+            links (`list[str]`, optional):
+                Related KB node titles for wikilink traceability.
+        """
+        if not self._kb_enabled():
+            return _tool_chunk(
+                "save_to_knowledge requires knowledge_base_id to be configured.",
+                ok=False,
+            )
+        title = (title or "").strip()
+        content = (content or "").strip()
+        if not title or not content:
+            return _tool_chunk(
+                "Error: title and content are required.",
+                ok=False,
+            )
+
+        response = await self._run_reme_job(
+            "save_to_knowledge",
+            needs_llm=True,
+            title=title,
+            content=content,
+            bucket=(bucket or "business/wiki").strip(),
+            preconditions=(preconditions or "").strip(),
+            steps=list(steps or []),
+            expected=(expected or "").strip(),
+            priority=(priority or "").strip(),
+            requirement_id=(requirement_id or "").strip(),
+            links=list(links or []),
+        )
+        if response is None:
+            return _tool_chunk("ReMe is not started.", ok=False)
+        answer = str(response.answer or "").strip() or "save_to_knowledge finished"
         return _tool_chunk(answer, ok=response.success)
 
     # ── reranker helpers ──────────────────────────────────────────────
@@ -1206,6 +1453,41 @@ class ReMeLightMemoryManager(BaseMemoryManager):
         )
         if response is not None and not response.success:
             raise RuntimeError(str(response.answer))
+        await self._maybe_run_knowledge_dream(**kwargs)
+
+    async def knowledge_dream(self, **kwargs: Any) -> None:
+        """Extract recent daily notes into the shared knowledge base (ReMe)."""
+        memory_config = self.get_memory_config()
+        if not self._kb_enabled(memory_config):
+            return
+        if not memory_config.knowledge_dream_enabled:
+            return
+
+        response = await self._run_reme_job(
+            "knowledge_dream",
+            needs_llm=True,
+            hint=str(kwargs.get("hint") or ""),
+            scan_days=int(
+                kwargs.get("scan_days", memory_config.knowledge_scan_days),
+            ),
+            max_units=int(
+                kwargs.get("max_units", memory_config.knowledge_max_units),
+            ),
+        )
+        if response is not None and not response.success:
+            raise RuntimeError(str(response.answer))
+
+    async def _maybe_run_knowledge_dream(self, **kwargs: Any) -> None:
+        """Run knowledge_dream after auto_dream when configured."""
+        memory_config = self.get_memory_config()
+        if not self._kb_enabled(memory_config):
+            return
+        if not memory_config.knowledge_dream_enabled:
+            return
+        if memory_config.knowledge_dream_cron_enabled:
+            # Standalone cron owns scheduled runs; skip the chained pass.
+            return
+        await self.knowledge_dream(**kwargs)
 
     async def daily_paper(self, **kwargs: Any) -> None:
         """Build one Daily Paper brief and publish its result to inbox."""

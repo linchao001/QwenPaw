@@ -207,6 +207,8 @@ SUPPORTED_AGENT_LANGUAGES: frozenset[str] = _discover_agent_languages()
 
 BUILTIN_QA_AGENT_ID = "QwenPaw_QA_Agent_0.2"
 BUILTIN_QA_AGENT_NAME = "QA Agent"
+# Default shared ReMe knowledge-base entity mounted into every agent workspace.
+DEFAULT_SHARED_KNOWLEDGE_BASE_ID = "zhb_kb"
 # Default skills when the builtin QA workspace is first created only.
 BUILTIN_QA_AGENT_SKILL_NAMES: tuple[str, ...] = (
     "guidance",

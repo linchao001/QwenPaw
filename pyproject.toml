@@ -21,7 +21,7 @@ dependencies = [
     "playwright>=1.49.0",
     "questionary>=2.1.1",
     "mss>=9.0.0",
-    "reme-ai==0.4.1.5",
+    "reme-ai>=0.4.1.5,<0.5",
     "transformers>=4.30.0",
     "python-dotenv>=1.0.0",
     "python-socks>=2.5.3",
@@ -156,6 +156,9 @@ qoder = [
 full = [
     "qwenpaw[hub,local,whisper,codex,qoder]",
 ]
+
+# Team distribution with a local ReMe fork: bash scripts/team_wheel_build.sh
+# Dev fallback: pip install -e ../ReMe
 sip = [
     "pyVoIP>=1.6.0",
     "dashscope>=1.0.0",

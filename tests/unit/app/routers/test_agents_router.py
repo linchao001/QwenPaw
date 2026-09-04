@@ -1188,6 +1188,39 @@ async def test_create_agent_default_workspace_under_working_dir(
 
 
 @pytest.mark.asyncio
+async def test_create_agent_mounts_default_shared_knowledge_base(
+    fake_config,
+    monkeypatch,
+    tmp_path,
+):
+    """New agents bind to the shared ReMe KB (zhb), not kb_{agent_id}."""
+    saved: list[AgentProfileConfig] = []
+
+    def capture_persist(_agent_id, _ref, cfg):
+        saved.append(cfg)
+
+    _make_create_stubs(fake_config, monkeypatch)
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.agents._persist_created_agent",
+        capture_persist,
+    )
+    monkeypatch.setattr(
+        "qwenpaw.app.routers.agents.WORKING_DIR",
+        str(tmp_path),
+    )
+
+    await create_agent(
+        request=CreateAgentRequest(id="biz-agent", name="Biz"),
+        http_request=None,
+    )
+
+    assert len(saved) == 1
+    kb_id = saved[0].running.reme_light_memory_config.knowledge_base_id
+    assert kb_id == "zhb_kb"
+    assert kb_id != "kb_biz-agent"
+
+
+@pytest.mark.asyncio
 async def test_create_agent_accepts_non_home_workspace_root(
     fake_config,
     monkeypatch,

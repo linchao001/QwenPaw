@@ -211,8 +211,44 @@ def test_zh_memory_prompt_describes_the_four_memory_surfaces() -> None:
     assert "`daily-notes/YYYY-MM-DD.md` 是你的日记本和每日笔记" in prompt
     assert "`daily-notes/YYYY-MM-DD/{topic}.md`" in prompt
     assert "`daily-notes` 和 `knowledge` 下的所有 Markdown 文件" in prompt
-    assert "先使用 `memory_search`" in prompt
+    assert "不要一上来就检索" in prompt
+    assert "明确需要" in prompt
+    assert "`memory_search`" in prompt
+    assert "先使用 `memory_search`" not in prompt
     assert "再使用 `read_file` 按路径渐进式展开" in prompt
+
+
+def test_en_memory_search_guidance_is_on_demand() -> None:
+    prompt = build_memory_guidance_prompt(
+        "en",
+        daily_dir="daily-notes",
+        digest_dir="knowledge",
+    )
+
+    assert "Do not search on the first reply by default" in prompt
+    assert "only when you clearly need" in prompt
+    assert "first use `memory_search`" not in prompt
+
+
+def test_shared_kb_search_guidance_is_on_demand() -> None:
+    zh = build_memory_guidance_prompt(
+        "zh",
+        knowledge_enabled=True,
+        knowledge_dir="knowledge",
+    )
+    en = build_memory_guidance_prompt(
+        "en",
+        knowledge_enabled=True,
+        knowledge_dir="knowledge",
+    )
+
+    assert "不要一上来就检索" in zh
+    assert "明确需要" in zh
+    assert "优先用 `memory_search`" not in zh
+    assert "`scope=agent`" in zh
+    assert "Do not search on the first reply by default" in en
+    assert "prefer `memory_search`" not in en
+    assert "`scope=agent`" in en
 
 
 def test_reme_declares_its_enabled_cron_jobs() -> None:

@@ -10,14 +10,19 @@ from qwenpaw.config.config import (
 )
 
 
-def _config_for_embedding(embedding: EmbeddingModelConfig) -> dict:
+def _config_for_embedding(
+    embedding: EmbeddingModelConfig,
+    *,
+    knowledge_base_id: str | None = None,
+) -> dict:
+    reme_kwargs: dict = {"embedding_model_config": embedding}
+    if knowledge_base_id is not None:
+        reme_kwargs["knowledge_base_id"] = knowledge_base_id
     agent_config = AgentProfileConfig(
         id="agent-1",
         name="Agent One",
         running=AgentsRunningConfig(
-            reme_light_memory_config=ReMeLightMemoryConfig(
-                embedding_model_config=embedding,
-            ),
+            reme_light_memory_config=ReMeLightMemoryConfig(**reme_kwargs),
         ),
     )
     return get_reme_app_config(
@@ -227,3 +232,48 @@ def test_ollama_embedding_without_host_still_enables_with_model() -> None:
         == "default"
     )
     assert not cfg["components"]["as_embedding"]["default"]["credential"]
+
+
+def _config_with_kb(kb_id: str = "zhb_kb") -> dict:
+    agent_config = AgentProfileConfig(
+        id="agent-kb",
+        name="KB Agent",
+        running=AgentsRunningConfig(
+            reme_light_memory_config=ReMeLightMemoryConfig(
+                knowledge_base_id=kb_id,
+                embedding_model_config=EmbeddingModelConfig(),
+            ),
+        ),
+    )
+    return get_reme_app_config(
+        working_dir="/tmp/qwenpaw-kb-agent",
+        agent_config=agent_config,
+    )
+
+
+def test_knowledge_jobs_registered_when_kb_id_set() -> None:
+    cfg = _config_with_kb()
+
+    assert cfg["knowledge_base_id"] == "zhb_kb"
+    assert cfg["knowledge_dir"] == "knowledge"
+    assert "knowledge_search" in cfg["jobs"]
+    assert "knowledge_dream" in cfg["jobs"]
+    assert "save_to_knowledge" in cfg["jobs"]
+    assert "list_knowledge_inbox" in cfg["jobs"]
+
+
+def test_knowledge_jobs_absent_without_kb_id() -> None:
+    cfg = _config_for_embedding(
+        EmbeddingModelConfig(),
+        knowledge_base_id="",
+    )
+
+    assert "knowledge_base_id" not in cfg
+    assert "knowledge_search" not in cfg["jobs"]
+
+
+def test_knowledge_jobs_registered_by_default() -> None:
+    cfg = _config_for_embedding(EmbeddingModelConfig())
+
+    assert cfg["knowledge_base_id"] == "zhb_kb"
+    assert "knowledge_search" in cfg["jobs"]

@@ -4,11 +4,53 @@ Run from **repo root**.
 
 ## Build wheel (with latest console)
 
+**Linux / macOS / Git Bash:**
+
 ```bash
 bash scripts/wheel_build.sh
 ```
 
+**Windows PowerShell:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/wheel_build.ps1
+```
+
 - Builds the console frontend (`console/`), copies `console/dist` to `src/qwenpaw/console/dist`, then builds the wheel. Output: `dist/*.whl`.
+
+## Team install (custom ReMe + qwenpaw)
+
+When PyPI `reme-ai` is too old, build **two wheels** and install with one command (no `pyproject.toml` changes).
+
+**Maintainer — build wheels:**
+
+```bash
+bash scripts/team_wheel_build.sh
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/team_wheel_build.ps1
+```
+
+ReMe path: `QWENPAW_REME_SRC=/path/to/ReMe` (bash) or `$env:QWENPAW_REME_SRC = "D:\path\to\ReMe"` (PowerShell).
+
+Output: `dist/qwenpaw-*.whl`, `dist/reme_ai-*.whl`, plus `team_install.ps1`, `team_install.sh`, `INSTALL.txt`. Zip `dist/` and share.
+
+**Team member — install (one command, inside extracted `dist/` folder):**
+
+Requires Git + SSH access to `gitlab.internal.qifeng.ai` (clones into `~/.reme/knowledge_bases/`, directory `zhb_kb`).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\team_install.ps1
+```
+
+```bash
+bash ./team_install.sh
+```
+
+Skip knowledge-base clone: `QWENPAW_SKIP_KB=1` (bash) or `$env:QWENPAW_SKIP_KB=1` (PowerShell).
+
+Requires Python 3.11–3.13. The install script creates `.venv` by default (`QWENPAW_SKIP_VENV=1` to skip).
 
 ## Build website
 

@@ -88,7 +88,17 @@ def test_daily_paper_cron_is_disabled_by_default():
     assert cfg.daily_paper_topics == ""
 
 
-@pytest.mark.parametrize("field", ["dream_cron", "daily_paper_cron"])
+def test_knowledge_base_defaults_are_enabled():
+    cfg = ReMeLightMemoryConfig()
+
+    assert cfg.knowledge_base_id == "zhb_kb"
+    assert cfg.knowledge_search_default == "knowledge"
+    assert cfg.knowledge_dream_enabled is True
+    assert cfg.knowledge_dream_cron_enabled is False
+    assert cfg.knowledge_write_mode == "strict"
+
+
+@pytest.mark.parametrize("field", ["dream_cron", "daily_paper_cron", "knowledge_dream_cron"])
 def test_service_cron_rejects_values_the_scheduler_cannot_parse(field):
     with pytest.raises(ValidationError, match="Invalid cron expression"):
         ReMeLightMemoryConfig.model_validate({field: "61 * * * *"})

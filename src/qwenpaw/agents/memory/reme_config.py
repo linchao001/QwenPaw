@@ -49,8 +49,217 @@ def build_reme_app_config(
             "log_to_console": True,
         },
     )
+    _apply_knowledge_config(cfg, reme_config)
 
     return cfg
+
+
+def _apply_knowledge_config(
+    cfg: dict[str, Any],
+    reme_config: Any,
+) -> None:
+    """Pass shared-KB settings into embedded ReMe (mount + jobs via ReMe)."""
+    kb_id = (getattr(reme_config, "knowledge_base_id", None) or "").strip()
+    if not kb_id:
+        return
+
+    knowledge_dir = (
+        getattr(reme_config, "knowledge_dir_name", None) or "knowledge"
+    ).strip() or "knowledge"
+    cfg.update(
+        {
+            "knowledge_base_id": kb_id,
+            "knowledge_bases_dir": (
+                getattr(reme_config, "knowledge_bases_dir", None) or ""
+            ).strip(),
+            "knowledge_dir": knowledge_dir,
+            "knowledge_domain": getattr(
+                reme_config,
+                "knowledge_domain",
+                "business",
+            ),
+            "knowledge_write_mode": getattr(
+                reme_config,
+                "knowledge_write_mode",
+                "strict",
+            ),
+            "knowledge_scan_days": int(
+                getattr(reme_config, "knowledge_scan_days", 2),
+            ),
+            "knowledge_max_units": int(
+                getattr(reme_config, "knowledge_max_units", 8),
+            ),
+            "create_knowledge_base": bool(
+                getattr(reme_config, "create_knowledge_base", False),
+            ),
+            "knowledge_inbox_enabled": bool(
+                getattr(reme_config, "knowledge_inbox_enabled", True),
+            ),
+            "knowledge_dedup_enabled": bool(
+                getattr(reme_config, "knowledge_dedup_enabled", True),
+            ),
+            "knowledge_dedup_threshold": float(
+                getattr(reme_config, "knowledge_dedup_threshold", 0.78),
+            ),
+            "knowledge_merge_enabled": bool(
+                getattr(reme_config, "knowledge_merge_enabled", True),
+            ),
+            "knowledge_merge_threshold": float(
+                getattr(reme_config, "knowledge_merge_threshold", 0.82),
+            ),
+            "knowledge_merge_margin": float(
+                getattr(reme_config, "knowledge_merge_margin", 0.15),
+            ),
+            "knowledge_related_threshold": float(
+                getattr(reme_config, "knowledge_related_threshold", 0.70),
+            ),
+            "knowledge_merge_max_updates": int(
+                getattr(reme_config, "knowledge_merge_max_updates", 5),
+            ),
+        },
+    )
+    cfg.setdefault("jobs", {}).update(_knowledge_jobs())
+
+
+def _knowledge_jobs() -> dict[str, Any]:
+    """ReMe job definitions for shared knowledge bases (logic lives in ReMe)."""
+    return {
+        "list_knowledge_bases": {
+            "backend": "base",
+            "description": (
+                "List shared knowledge bases under knowledge_bases_dir."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+            "steps": [{"backend": "list_knowledge_bases_step"}],
+        },
+        "knowledge_base_meta": {
+            "backend": "base",
+            "description": (
+                "Return metadata for the active or requested shared "
+                "knowledge base."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "knowledge_base_id": {
+                        "type": "string",
+                        "default": "",
+                    },
+                },
+            },
+            "steps": [{"backend": "knowledge_base_meta_step"}],
+        },
+        "knowledge_search": {
+            "backend": "base",
+            "description": (
+                "Hybrid search scoped to the mounted shared knowledge base."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "default": 5},
+                    "min_score": {"type": "number", "default": 0.0},
+                    "bucket": {"type": "string", "default": "all"},
+                },
+                "required": ["query"],
+            },
+            "steps": [
+                {
+                    "backend": "knowledge_search_step",
+                    "vector_weight": 0.7,
+                    "candidate_multiplier": 5.0,
+                    "expand_links": True,
+                    "max_links_per_direction": 10,
+                },
+            ],
+        },
+        "save_to_knowledge": {
+            "backend": "base",
+            "description": (
+                "Write or refine one published node in the shared KB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                    "bucket": {"type": "string", "default": "business/wiki"},
+                    "preconditions": {"type": "string", "default": ""},
+                    "steps": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                    "expected": {"type": "string", "default": ""},
+                    "priority": {"type": "string", "default": ""},
+                    "requirement_id": {"type": "string", "default": ""},
+                    "links": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                },
+                "required": ["title", "content"],
+            },
+            "steps": [{"backend": "save_to_knowledge_step"}],
+        },
+        "knowledge_dream": {
+            "backend": "base",
+            "description": (
+                "Extract recent daily notes into the mounted shared KB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hint": {"type": "string", "default": ""},
+                    "scan_days": {"type": "integer", "default": 2},
+                    "max_units": {"type": "integer", "default": 8},
+                },
+            },
+            "steps": [{"backend": "knowledge_dream_step"}],
+        },
+        "list_knowledge_inbox": {
+            "backend": "base",
+            "description": "List pending _inbox drafts for the active KB.",
+            "parameters": {"type": "object", "properties": {}},
+            "steps": [{"backend": "list_knowledge_inbox_step"}],
+        },
+        "promote_knowledge_inbox": {
+            "backend": "base",
+            "description": "Promote one _inbox draft into a published bucket.",
+            "parameters": {
+                "type": "object",
+                "properties": {"stem": {"type": "string"}},
+                "required": ["stem"],
+            },
+            "steps": [{"backend": "promote_knowledge_inbox_step"}],
+        },
+        "merge_knowledge_inbox": {
+            "backend": "base",
+            "description": "Merge one _inbox draft into a published node.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stem": {"type": "string"},
+                    "target_path": {"type": "string", "default": ""},
+                    "mode": {"type": "string", "default": "REFINE"},
+                },
+                "required": ["stem"],
+            },
+            "steps": [{"backend": "merge_knowledge_inbox_step"}],
+        },
+        "reject_knowledge_inbox": {
+            "backend": "base",
+            "description": "Reject one _inbox draft.",
+            "parameters": {
+                "type": "object",
+                "properties": {"stem": {"type": "string"}},
+                "required": ["stem"],
+            },
+            "steps": [{"backend": "reject_knowledge_inbox_step"}],
+        },
+    }
 
 
 def _base_config() -> dict[str, Any]:

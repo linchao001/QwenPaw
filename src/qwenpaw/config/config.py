@@ -38,6 +38,7 @@ from qwenpaw.exceptions import (
 
 from .timezone import detect_system_timezone
 from ..constant import (
+    DEFAULT_SHARED_KNOWLEDGE_BASE_ID,
     HEARTBEAT_DEFAULT_EVERY,
     HEARTBEAT_DEFAULT_TARGET,
     HEARTBEAT_DEFAULT_TIMEOUT_SECONDS,
@@ -968,7 +969,76 @@ class ReMeLightMemoryConfig(BaseModel):
         description="Whether to expose the memory_search tool to the agent",
     )
 
-    @field_validator("dream_cron", "daily_paper_cron")
+    # Shared knowledge base (ReMe-owned; effective when knowledge_base_id is set).
+    knowledge_base_id: str = Field(
+        default=DEFAULT_SHARED_KNOWLEDGE_BASE_ID,
+        description=(
+            "Shared knowledge-base id under knowledge_bases_dir. "
+            "Empty disables KB mount and knowledge jobs."
+        ),
+    )
+    knowledge_bases_dir: str = Field(
+        default="",
+        description=(
+            "Root for shared KB entities. Empty uses ReMe default "
+            "(REME_KNOWLEDGE_BASES_DIR or ~/.reme/knowledge_bases)."
+        ),
+    )
+    knowledge_dir_name: str = Field(
+        default="knowledge",
+        description="Workspace mount name for the active shared knowledge base.",
+    )
+    knowledge_domain: Literal["business", "testcase"] = Field(
+        default="business",
+        description="Knowledge dream extract domain (ReMe knowledge_domain).",
+    )
+    knowledge_dream_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run ReMe knowledge_dream after auto_dream when a KB is configured."
+        ),
+    )
+    knowledge_dream_cron_enabled: bool = Field(
+        default=False,
+        description="Schedule standalone knowledge_dream via QwenPaw cron.",
+    )
+    knowledge_dream_cron: str = Field(
+        default="0 23 * * *",
+        description=(
+            "Cron for knowledge_dream when knowledge_dream_cron_enabled "
+            "is true."
+        ),
+    )
+    knowledge_scan_days: int = Field(default=2, ge=1, le=30)
+    knowledge_max_units: int = Field(default=8, ge=1, le=50)
+    knowledge_write_mode: Literal["open", "strict"] = Field(
+        default="strict",
+        description="ReMe strict routes uncertain units to _inbox.",
+    )
+    knowledge_search_default: Literal["all", "knowledge", "agent"] = Field(
+        default="knowledge",
+        description=(
+            "Default memory_search scope when a shared KB is configured."
+        ),
+    )
+    create_knowledge_base: bool = Field(
+        default=False,
+        description="Ask ReMe to create a KB skeleton when kb_id is missing.",
+    )
+    knowledge_inbox_enabled: bool = Field(default=True)
+    knowledge_dedup_enabled: bool = Field(default=True)
+    knowledge_dedup_threshold: float = Field(default=0.78, ge=0.0, le=1.0)
+    knowledge_merge_enabled: bool = Field(default=True)
+    knowledge_merge_threshold: float = Field(default=0.82, ge=0.0, le=1.0)
+    knowledge_merge_margin: float = Field(default=0.15, ge=0.0, le=1.0)
+    knowledge_related_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
+    knowledge_merge_max_updates: int = Field(default=5, ge=1)
+    knowledge_dream_inbox_push_enabled: bool = Field(
+        default=True,
+        description="Push knowledge_dream results to the QwenPaw inbox.",
+    )
+
+    @field_validator("dream_cron", "daily_paper_cron", "knowledge_dream_cron")
     @classmethod
     def validate_service_cron(cls, value: str) -> str:
         """Reject expressions that the runtime scheduler cannot install."""
@@ -994,6 +1064,7 @@ class ReMeLightMemoryConfig(BaseModel):
             "auto_memory_inbox_push_enabled",
             "auto_dream_inbox_push_enabled",
             "daily_paper_inbox_push_enabled",
+            "knowledge_dream_inbox_push_enabled",
         ):
             migrated.setdefault(field_name, legacy_value)
         return migrated
@@ -2653,17 +2724,37 @@ class ToolsConfig(BaseModel):
         icon value.
         """
         defaults = _default_builtin_tools()
-        # Keep persisted configurations from the former stable-track name
-        # compatible with the unified browser identity.
-        legacy = self.builtin_tools.pop("browser_use", None)
-        if legacy is not None:
-            unified = self.builtin_tools.get("browser")
-            if unified is not None:
-                unified.enabled = legacy.enabled
-            elif "browser" in defaults:
-                self.builtin_tools["browser"] = defaults["browser"].model_copy(
-                    update={"enabled": legacy.enabled},
-                )
+        legacy_use = self.builtin_tools.pop("browser_use", None)
+        legacy_browser = self.builtin_tools.pop("browser", None)
+        # Unified track exposes ``browser``; stable track exposes ``browser_use``.
+        if "browser" in defaults:
+            enabled = None
+            if legacy_use is not None:
+                enabled = legacy_use.enabled
+            elif legacy_browser is not None:
+                enabled = legacy_browser.enabled
+            if enabled is not None:
+                unified = self.builtin_tools.get("browser")
+                if unified is not None:
+                    unified.enabled = enabled
+                else:
+                    self.builtin_tools["browser"] = defaults[
+                        "browser"
+                    ].model_copy(update={"enabled": enabled})
+        if "browser_use" in defaults:
+            enabled = None
+            if legacy_browser is not None:
+                enabled = legacy_browser.enabled
+            elif legacy_use is not None:
+                enabled = legacy_use.enabled
+            if enabled is not None:
+                stable = self.builtin_tools.get("browser_use")
+                if stable is not None:
+                    stable.enabled = enabled
+                else:
+                    self.builtin_tools["browser_use"] = defaults[
+                        "browser_use"
+                    ].model_copy(update={"enabled": enabled})
         for name, tc in defaults.items():
             if name not in self.builtin_tools:
                 self.builtin_tools[name] = tc
@@ -3216,6 +3307,53 @@ def migrate_channel_display_fields(channels: object) -> bool:
     return migrated
 
 
+def _legacy_auto_kb_id(agent_id: str) -> str:
+    """Return the old per-agent auto KB id (``kb_{agent_id}``)."""
+    import re
+
+    safe_agent = re.sub(r"[^a-zA-Z0-9._-]", "_", (agent_id or "").strip())
+    return f"kb_{safe_agent}" if safe_agent else ""
+
+
+def migrate_shared_knowledge_base_config(
+    data: object,
+    *,
+    agent_id: str = "",
+) -> bool:
+    """Mount the default shared KB for agents that never configured one.
+
+    Also remaps legacy auto-created ``kb_{agent_id}`` ids (empty per-agent
+    skeletons) to the team shared knowledge base.
+    """
+    if not isinstance(data, dict):
+        return False
+    running = data.get("running")
+    if not isinstance(running, dict):
+        return False
+    reme = running.get("reme_light_memory_config")
+    if not isinstance(reme, dict):
+        running["reme_light_memory_config"] = {
+            "knowledge_base_id": DEFAULT_SHARED_KNOWLEDGE_BASE_ID,
+        }
+        return True
+    kb_id = reme.get("knowledge_base_id")
+    if kb_id is None or (isinstance(kb_id, str) and not kb_id.strip()):
+        reme["knowledge_base_id"] = DEFAULT_SHARED_KNOWLEDGE_BASE_ID
+        return True
+    if not isinstance(kb_id, str):
+        return False
+    normalized = kb_id.strip()
+    # Previous team default directory/id was ``zhb``; remap to ``zhb_kb``.
+    if normalized == "zhb":
+        reme["knowledge_base_id"] = DEFAULT_SHARED_KNOWLEDGE_BASE_ID
+        return True
+    legacy_auto = _legacy_auto_kb_id(agent_id)
+    if legacy_auto and normalized == legacy_auto:
+        reme["knowledge_base_id"] = DEFAULT_SHARED_KNOWLEDGE_BASE_ID
+        return True
+    return False
+
+
 def migrate_project_directory_config(data: object) -> bool:
     """Move the legacy Coding Mode directory into the Agent root once."""
     if not isinstance(data, dict):
@@ -3396,6 +3534,10 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
                 data.pop("last_dispatch")
                 last_dispatch_migrated = True
         project_dir_migrated = migrate_project_directory_config(data)
+        knowledge_base_migrated = migrate_shared_knowledge_base_config(
+            data,
+            agent_id=agent_id,
+        )
 
         # Match the existing migration behavior: migrate this workspace only
         # when its agent configuration is loaded.
@@ -3418,6 +3560,7 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
 
         migrations_applied = (
             project_dir_migrated,
+            knowledge_base_migrated,
             mail_credentials_migrated,
             weixin_migrated,
             display_migrated,
